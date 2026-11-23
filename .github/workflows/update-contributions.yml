@@ -1,0 +1,79 @@
+name: Update contribution heatmap
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contribution-heatmap-main
+  cancel-in-progress: false
+
+jobs:
+  update-contributions:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install collector dependencies
+        run: python -m pip install "requests==2.32.3" "beautifulsoup4==4.12.3"
+
+      - name: Fetch contribution data
+        run: python scripts/fetch_contributions.py
+
+      - name: Generate heatmap SVG
+        run: python scripts/generate_heatmap.py
+
+      - name: Validate generated files
+        run: |
+          test -s data/contributions.json
+          test -s assets/contrib-heatmap.svg
+          python - <<'PY'
+          import json
+          from datetime import date
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          data = json.loads(Path("data/contributions.json").read_text(encoding="utf-8"))
+          days = data.get("days")
+          assert data.get("schema_version") == 1 and days, "Contribution data is empty or has an unsupported schema"
+          dates = [date.fromisoformat(entry["date"]) for entry in days]
+          assert len(dates) == len(set(dates)), "Contribution dates are duplicated"
+          assert all(isinstance(entry["count"], int) and not isinstance(entry["count"], bool) and entry["count"] >= 0 for entry in days), "Contribution counts must be non-negative integers"
+          svg = ET.parse("assets/contrib-heatmap.svg").getroot()
+          namespace = {"svg": "http://www.w3.org/2000/svg"}
+          cells = svg.findall(".//svg:rect[@data-count]", namespace)
+          assert len(cells) == len(days), "SVG dated cells do not match contribution JSON"
+          svg_counts = {cell.attrib["data-date"]: int(cell.attrib["data-count"]) for cell in cells}
+          json_counts = {entry["date"]: entry["count"] for entry in days}
+          assert svg_counts == json_counts, "SVG contribution values do not match contribution JSON"
+          print(f"Validated {len(data['days'])} contribution dates and the generated SVG.")
+          PY
+
+      - name: Commit and push generated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- data/contributions.json assets/contrib-heatmap.svg
+          if git diff --cached --quiet; then
+            echo "Generated files are unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: update contribution heatmap"
+          git push origin HEAD:main
